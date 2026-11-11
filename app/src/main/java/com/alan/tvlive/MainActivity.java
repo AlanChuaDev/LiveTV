@@ -86,15 +86,13 @@ public class MainActivity extends Activity {
         "TVB Plus",
         "TVB明珠台",
         "TVB翡翠台",
-        "無綫新聞台",
-        "無綫財經·體育·資訊台"
+        "無綫新聞台"
     };
     static final String[] URLS = {
-        "https://live.yes2049.com/channels/j2/",
-        "https://live.yes2049.com/channels/tvb-pearl/",
-        "https://live.yes2049.com/channels/tvb-jade/",
-        "https://live.yes2049.com/channels/tvb-news-channel/",
-        "https://live.yes2049.com/channels/tvb-finance-information-channel/"
+        "https://live.yes2049.com/channels/j2/?ref=MY9534",
+        "https://live.yes2049.com/channels/tvb-pearl/?ref=MY9534",
+        "https://live.yes2049.com/channels/tvb-jade/?ref=MY9534",
+        "https://live.yes2049.com/channels/tvb-news-channel/?ref=MY9534"
     };
 
     static final String[] ALLOW_HOSTS = { "yes2049.com", "yeslivetv.com", "cloudflare" };
