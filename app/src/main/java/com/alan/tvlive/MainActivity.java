@@ -472,6 +472,10 @@ public class MainActivity extends Activity {
         startClean();
     }
 
+    void toast(String s) {
+        Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+    }
+
     int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density);
     }
