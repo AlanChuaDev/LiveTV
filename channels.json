@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "menuTitle": "May姐专属",
+  "menuSub": "天天开心　看得开心",
+  "lockSeconds": 15,
+  "allowHosts": ["yes2049.com"],
+  "channels": [
+    { "name": "TVB Plus", "url": "https://live.yes2049.com/channels/j2/?ref=MY9534" },
+    { "name": "TVB明珠台", "url": "https://live.yes2049.com/channels/tvb-pearl/?ref=MY9534" },
+    { "name": "TVB翡翠台", "url": "https://live.yes2049.com/channels/tvb-jade/?ref=MY9534" },
+    { "name": "無綫新聞台", "url": "https://live.yes2049.com/channels/tvb-news-channel/?ref=MY9534" }
+  ]
+}

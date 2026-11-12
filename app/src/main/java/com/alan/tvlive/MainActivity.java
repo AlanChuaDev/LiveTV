@@ -2,6 +2,7 @@ package com.alan.tvlive;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -39,7 +40,17 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Random;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 public class MainActivity extends Activity {
     // 去广告开关：拦截后视频播不出来就改成 false
@@ -49,7 +60,7 @@ public class MainActivity extends Activity {
     // 用 App 自己的音量条（false = 完全交给系统处理音量键）
     static final boolean CUSTOM_VOLUME = true;
     // 模拟点击播放后，锁定操作并等待的毫秒数（期间遥控器所有按键无效，之后才放大）
-    static final int LOCK_MS = 15000;
+    static final int DEFAULT_LOCK_MS = 15000;
     // 切到别的 App 后，在后台超过这个毫秒数就彻底退出
     static final long BG_EXIT_MS = 30000;
     // 启动加载页至少显示多久（毫秒），避免一闪而过
@@ -58,6 +69,9 @@ public class MainActivity extends Activity {
     static final long PANEL_HIDE_MS = 10000;
     // 音量条显示多久
     static final long VOL_HIDE_MS = 2000;
+    // 频道列表的远程文件：打开 App 时会去读它；链接变了只要改这个文件，不用重新编译
+    static final String CONFIG_URL = "https://raw.githubusercontent.com/AlanChuaDev/LiveTV/main/channels.json";
+    static final String KEY_CONFIG = "config";
 
     // 菜单上的专属文字，想改话就改这里
     static final String MENU_BRAND = "TVB 直播";
@@ -81,21 +95,21 @@ public class MainActivity extends Activity {
     static final int COLOR_GOLD = 0xFFF7C873;
     static final int COLOR_LEAF = 0xFF4F7F58;
 
-    // 频道列表：名字和网址一一对应，要增减频道就改这两个数组
-    static final String[] NAMES = {
+    // 自带的频道列表（没网、远程文件读不到时才用）。平时以 channels.json 为准。
+    static final String[] DEFAULT_NAMES = {
         "TVB Plus",
         "TVB明珠台",
         "TVB翡翠台",
         "無綫新聞台"
     };
-    static final String[] URLS = {
+    static final String[] DEFAULT_URLS = {
         "https://live.yes2049.com/channels/j2/?ref=MY9534",
         "https://live.yes2049.com/channels/tvb-pearl/?ref=MY9534",
         "https://live.yes2049.com/channels/tvb-jade/?ref=MY9534",
         "https://live.yes2049.com/channels/tvb-news-channel/?ref=MY9534"
     };
 
-    static final String[] ALLOW_HOSTS = { "yes2049.com", "yeslivetv.com", "cloudflare" };
+    static final String[] DEFAULT_ALLOW_HOSTS = { "yes2049.com", "yeslivetv.com", "cloudflare" };
     static final String[] AD_HOSTS = {
         "doubleclick.net", "googlesyndication.com", "googleadservices.com",
         "googletagservices.com", "adservice.google", "2mdn.net", "adnxs.com",
@@ -284,8 +298,21 @@ public class MainActivity extends Activity {
     View volFill;
     View volRest;
     TextView volText;
-    LinearLayout[] btns = new LinearLayout[NAMES.length];
-    LinearLayout[] pRows = new LinearLayout[NAMES.length];
+    LinearLayout[] btns = new LinearLayout[0];
+    LinearLayout[] pRows = new LinearLayout[0];
+    LinearLayout menuCol, panelCol, updRow;
+    TextView menuTitleV, menuSubV;
+    SharedPreferences prefs;
+    // 下面这些平时用自带的值，读到远程文件后会被换掉
+    String[] names = DEFAULT_NAMES;
+    String[] urls = DEFAULT_URLS;
+    String[] allowHosts = DEFAULT_ALLOW_HOSTS;
+    int lockMs = DEFAULT_LOCK_MS;
+    String menuTitle = MENU_TITLE;
+    String menuSub = MENU_SUB;
+    String jsInit = JS_INIT;
+    String jsFind = JS_FIND;
+    String jsEnlarge = JS_ENLARGE;
     View customView;
     WebChromeClient.CustomViewCallback customCb;
     AudioManager audio;
@@ -305,7 +332,9 @@ public class MainActivity extends Activity {
     int lastVol = -1;
     boolean tapped = false;
     boolean inPlayer = false;
-    boolean cleaned = false;
+    boolean cleaned = false;   // 已经离开加载页、进入菜单
+    boolean cleanDone = false;
+    boolean cfgDone = false;
     boolean panelOpen = false;
     int idx = 0;
 
@@ -337,14 +366,17 @@ public class MainActivity extends Activity {
         }
     };
 
-    // 清理完成（或超时）后，关闭加载页，进入选台菜单
+    // 缓存清理和频道更新都完成（或 6 秒超时）后，关闭加载页，进入选台菜单
     Runnable finishClean = new Runnable() {
         @Override
+        public void run() { tryEnter(true); }
+    };
+
+    Runnable markCleanDone = new Runnable() {
+        @Override
         public void run() {
-            if (cleaned) return;
-            cleaned = true;
-            loading.setVisibility(View.GONE);
-            showMenu();
+            cleanDone = true;
+            tryEnter(false);
         }
     };
 
@@ -353,6 +385,9 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        prefs = getSharedPreferences("tvlive", MODE_PRIVATE);
+        String saved = prefs.getString(KEY_CONFIG, null);
+        if (saved != null) parseConfig(saved, true);
         root = new FrameLayout(this);
         web = new WebView(this);
         root.addView(web, new FrameLayout.LayoutParams(-1, -1));
@@ -379,7 +414,7 @@ public class MainActivity extends Activity {
                 if (!r.isForMainFrame()) return false;
                 String host = r.getUrl().getHost();
                 if (host == null) return true;
-                for (String a : ALLOW_HOSTS) {
+                for (String a : allowHosts) {
                     if (host.contains(a)) return false;
                 }
                 return true;
@@ -406,7 +441,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView v, String url) {
                 if (!inPlayer) return;
-                v.evaluateJavascript(JS_INIT, null);
+                v.evaluateJavascript(jsInit, null);
                 if (!tapped && System.currentTimeMillis() >= lockUntil && pollGen != gen) {
                     pollGen = gen;
                     poll(gen);
@@ -492,7 +527,7 @@ public class MainActivity extends Activity {
         col.addView(t, lp(-2, -2, 0, 0, 0, dp(8)));
 
         TextView hint = new TextView(this);
-        hint.setText("正在清理缓存，马上就好");
+        hint.setText("正在更新频道列表，马上就好");
         hint.setTextColor(0xFF888888);
         hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
         col.addView(hint, lp(-2, -2, 0, 0, 0, 0));
@@ -508,11 +543,11 @@ public class MainActivity extends Activity {
 
         ScrollView sv = new ScrollView(this);
         sv.setFillViewport(true);
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setGravity(Gravity.CENTER);
-        col.setPadding(dp(40), dp(16), dp(40), dp(16));
-        sv.addView(col, new FrameLayout.LayoutParams(-1, -2));
+        menuCol = new LinearLayout(this);
+        menuCol.setOrientation(LinearLayout.VERTICAL);
+        menuCol.setGravity(Gravity.CENTER);
+        menuCol.setPadding(dp(40), dp(16), dp(40), dp(16));
+        sv.addView(menuCol, new FrameLayout.LayoutParams(-1, -2));
 
         TextView brand = new TextView(this);
         brand.setText(MENU_BRAND);
@@ -520,144 +555,177 @@ public class MainActivity extends Activity {
         brand.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         brand.setLetterSpacing(0.15f);
         brand.setGravity(Gravity.CENTER);
-        col.addView(brand, lp(-2, -2, 0, 0, 0, 0));
+        menuCol.addView(brand, lp(-2, -2, 0, 0, 0, 0));
 
-        TextView title = new TextView(this);
-        title.setText(MENU_TITLE);
-        title.setTextColor(COLOR_ACCENT);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 40);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setGravity(Gravity.CENTER);
-        col.addView(title, lp(-2, -2, 0, 0, 0, dp(2)));
+        menuTitleV = new TextView(this);
+        menuTitleV.setText(menuTitle);
+        menuTitleV.setTextColor(COLOR_ACCENT);
+        menuTitleV.setTextSize(TypedValue.COMPLEX_UNIT_SP, 40);
+        menuTitleV.setTypeface(Typeface.DEFAULT_BOLD);
+        menuTitleV.setGravity(Gravity.CENTER);
+        menuCol.addView(menuTitleV, lp(-2, -2, 0, 0, 0, dp(2)));
 
-        TextView sub = new TextView(this);
-        sub.setText(MENU_SUB);
-        sub.setTextColor(0xFFF4D5DC);
-        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        sub.setGravity(Gravity.CENTER);
-        col.addView(sub, lp(-2, -2, 0, 0, 0, dp(14)));
+        menuSubV = new TextView(this);
+        menuSubV.setText(menuSub);
+        menuSubV.setTextColor(0xFFF4D5DC);
+        menuSubV.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        menuSubV.setGravity(Gravity.CENTER);
+        menuCol.addView(menuSubV, lp(-2, -2, 0, 0, 0, dp(14)));
 
-        for (int i = 0; i < NAMES.length; i++) {
-            final int n = i;
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(16), 0, dp(24), 0);
-            row.setFocusable(true);
-            row.setClickable(true);
-
-            TextView badge = new TextView(this);
-            badge.setText(String.valueOf(i + 1));
-            badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-            badge.setTypeface(Typeface.DEFAULT_BOLD);
-            badge.setGravity(Gravity.CENTER);
-            row.addView(badge, lp(dp(40), dp(40), 0, 0, 0, 0));
-
-            TextView name = new TextView(this);
-            name.setText(NAMES[i]);
-            name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
-            name.setTypeface(Typeface.DEFAULT_BOLD);
-            name.setGravity(Gravity.CENTER_VERTICAL);
-            LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(0, -2, 1f);
-            np.setMargins(dp(20), 0, dp(12), 0);
-            row.addView(name, np);
-
-            TextView arrow = new TextView(this);
-            arrow.setText("›");
-            arrow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 32);
-            arrow.setTypeface(Typeface.DEFAULT_BOLD);
-            row.addView(arrow, lp(-2, -2, 0, 0, 0, 0));
-
-            paint(row, false);
-            row.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-                @Override
-                public void onFocusChange(View v, boolean f) {
-                    paint((LinearLayout) v, f);
-                }
-            });
-            row.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    openChannel(n);
-                }
-            });
-            col.addView(row, lp(dp(640), dp(58), 0, dp(4), 0, dp(4)));
-            btns[i] = row;
-        }
+        fillMenuRows();
 
         wrap.addView(sv, new FrameLayout.LayoutParams(-1, -1));
         menu = wrap;
         root.addView(menu, new FrameLayout.LayoutParams(-1, -1));
     }
 
+    // 把频道行（和最下面的「更新频道列表」）放进菜单。更新频道后会重新调用一次。
+    void fillMenuRows() {
+        // 前 3 个是品牌、标题、副标题，后面全是频道行
+        if (menuCol.getChildCount() > 3) menuCol.removeViews(3, menuCol.getChildCount() - 3);
+        btns = new LinearLayout[names.length];
+        for (int i = 0; i < names.length; i++) {
+            final int n = i;
+            LinearLayout row = makeMenuRow(String.valueOf(i + 1), names[i], new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    openChannel(n);
+                }
+            });
+            menuCol.addView(row, lp(dp(640), dp(58), 0, dp(4), 0, dp(4)));
+            btns[i] = row;
+        }
+        updRow = makeMenuRow("更", "更新频道列表", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toast("正在更新频道列表…");
+                fetchConfig(true);
+            }
+        });
+        menuCol.addView(updRow, lp(dp(640), dp(58), 0, dp(16), 0, dp(4)));
+    }
+
+    // 菜单里的一行：左边小方块（序号），中间名字，右边箭头（选中时才显示）
+    LinearLayout makeMenuRow(String badgeText, String label, View.OnClickListener click) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), 0, dp(24), 0);
+        row.setFocusable(true);
+        row.setClickable(true);
+
+        TextView badge = new TextView(this);
+        badge.setText(badgeText);
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        badge.setTypeface(Typeface.DEFAULT_BOLD);
+        badge.setGravity(Gravity.CENTER);
+        row.addView(badge, lp(dp(40), dp(40), 0, 0, 0, 0));
+
+        TextView name = new TextView(this);
+        name.setText(label);
+        name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
+        name.setTypeface(Typeface.DEFAULT_BOLD);
+        name.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(0, -2, 1f);
+        np.setMargins(dp(20), 0, dp(12), 0);
+        row.addView(name, np);
+
+        TextView arrow = new TextView(this);
+        arrow.setText("›");
+        arrow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 32);
+        arrow.setTypeface(Typeface.DEFAULT_BOLD);
+        row.addView(arrow, lp(-2, -2, 0, 0, 0, 0));
+
+        paint(row, false);
+        row.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+            @Override
+            public void onFocusChange(View v, boolean f) {
+                paint((LinearLayout) v, f);
+            }
+        });
+        row.setOnClickListener(click);
+        return row;
+    }
+
     // 播放时按 ← 弹出的频道栏（左侧，占屏幕宽度约 36%）
     void buildPanel() {
         int w = (int) (getResources().getDisplayMetrics().widthPixels * 0.36f);
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setBackgroundColor(0xEE0E0E0E);
-        col.setPadding(dp(24), dp(28), dp(24), dp(20));
+        panelCol = new LinearLayout(this);
+        panelCol.setOrientation(LinearLayout.VERTICAL);
+        panelCol.setBackgroundColor(0xEE0E0E0E);
+        panelCol.setPadding(dp(24), dp(28), dp(24), dp(20));
 
         TextView brand = new TextView(this);
         brand.setText(MENU_BRAND);
         brand.setTextColor(COLOR_ACCENT);
         brand.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         brand.setLetterSpacing(0.15f);
-        col.addView(brand, lp(-2, -2, 0, 0, 0, 0));
+        panelCol.addView(brand, lp(-2, -2, 0, 0, 0, 0));
 
         TextView title = new TextView(this);
         title.setText("频道");
         title.setTextColor(0xFFFFFFFF);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        col.addView(title, lp(-2, -2, 0, dp(2), 0, dp(14)));
-
-        for (int i = 0; i < NAMES.length; i++) {
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(14), 0, dp(14), 0);
-
-            TextView badge = new TextView(this);
-            badge.setText(String.valueOf(i + 1));
-            badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-            badge.setTypeface(Typeface.DEFAULT_BOLD);
-            badge.setGravity(Gravity.CENTER);
-            row.addView(badge, lp(dp(40), dp(40), 0, 0, 0, 0));
-
-            TextView name = new TextView(this);
-            name.setText(NAMES[i]);
-            name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
-            name.setTypeface(Typeface.DEFAULT_BOLD);
-            LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(0, -2, 1f);
-            np.setMargins(dp(14), 0, dp(8), 0);
-            row.addView(name, np);
-
-            TextView tag = new TextView(this);
-            tag.setText("播放中");
-            tag.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-            tag.setTypeface(Typeface.DEFAULT_BOLD);
-            tag.setPadding(dp(8), dp(2), dp(8), dp(2));
-            row.addView(tag, lp(-2, -2, 0, 0, 0, 0));
-
-            col.addView(row, lp(-1, dp(62), 0, dp(5), 0, dp(5)));
-            pRows[i] = row;
-        }
+        panelCol.addView(title, lp(-2, -2, 0, dp(2), 0, dp(14)));
 
         View sp = new View(this);
-        col.addView(sp, new LinearLayout.LayoutParams(-1, 0, 1f));
+        panelCol.addView(sp, new LinearLayout.LayoutParams(-1, 0, 1f));
 
         TextView tip = new TextView(this);
         tip.setText("上下键选择　OK 切换　→ 关闭");
         tip.setTextColor(0xFF8A8A8A);
         tip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         tip.setGravity(Gravity.CENTER);
-        col.addView(tip, lp(-1, -2, 0, 0, 0, 0));
+        panelCol.addView(tip, lp(-1, -2, 0, 0, 0, 0));
 
-        panel = col;
+        panel = panelCol;
         panel.setVisibility(View.GONE);
         root.addView(panel, new FrameLayout.LayoutParams(w, -1, Gravity.START));
+        fillPanelRows();
+    }
+
+    // 把频道行放进频道栏（排在标题后面、提示文字前面）。更新频道后会重新调用一次。
+    void fillPanelRows() {
+        int rows = panelCol.getChildCount() - 4;  // 4 = 品牌、标题、空白、提示
+        if (rows > 0) panelCol.removeViews(2, rows);
+        pRows = new LinearLayout[names.length];
+        for (int i = 0; i < names.length; i++) {
+            LinearLayout row = makePanelRow(i);
+            panelCol.addView(row, 2 + i, lp(-1, dp(62), 0, dp(5), 0, dp(5)));
+            pRows[i] = row;
+        }
         paintPanel();
+    }
+
+    LinearLayout makePanelRow(int i) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14), 0, dp(14), 0);
+
+        TextView badge = new TextView(this);
+        badge.setText(String.valueOf(i + 1));
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        badge.setTypeface(Typeface.DEFAULT_BOLD);
+        badge.setGravity(Gravity.CENTER);
+        row.addView(badge, lp(dp(40), dp(40), 0, 0, 0, 0));
+
+        TextView name = new TextView(this);
+        name.setText(names[i]);
+        name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        name.setTypeface(Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(0, -2, 1f);
+        np.setMargins(dp(14), 0, dp(8), 0);
+        row.addView(name, np);
+
+        TextView tag = new TextView(this);
+        tag.setText("播放中");
+        tag.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tag.setTypeface(Typeface.DEFAULT_BOLD);
+        tag.setPadding(dp(8), dp(2), dp(8), dp(2));
+        row.addView(tag, lp(-2, -2, 0, 0, 0, 0));
+        return row;
     }
 
     // 频道栏一行的外观：选中 = 琥珀底黑字；正在播放的台带「播放中」标签
@@ -774,7 +842,7 @@ public class MainActivity extends Activity {
 
     // 频道栏打开时的按键：上下选择，OK 切换，→ 关闭
     void handlePanelKey(int k) {
-        int n = URLS.length;
+        int n = urls.length;
         if (k == KeyEvent.KEYCODE_DPAD_UP) {
             pSel = (pSel - 1 + n) % n;
             paintPanel();
@@ -795,9 +863,145 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------- 远程频道列表（channels.json） ----------
+
+    // 加载页走到头的条件：缓存清完 + 频道文件读完（或者 6 秒超时强制进入）
+    void tryEnter(boolean force) {
+        if (cleaned) return;
+        if (!force && !(cleanDone && cfgDone)) return;
+        cleaned = true;
+        loading.setVisibility(View.GONE);
+        showMenu();
+    }
+
+    // 解析 channels.json。apply 为 true 时把里面的内容用起来；返回 false 表示文件不合格。
+    boolean parseConfig(String json, boolean apply) {
+        try {
+            if (json.startsWith("\uFEFF")) json = json.substring(1);
+            JSONObject o = new JSONObject(json);
+            JSONArray a = o.getJSONArray("channels");
+            List<String> ns = new ArrayList<>();
+            List<String> us = new ArrayList<>();
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject c = a.getJSONObject(i);
+                String n = c.optString("name", "").trim();
+                String u = c.optString("url", "").trim();
+                if (n.isEmpty() || !(u.startsWith("https://") || u.startsWith("http://"))) continue;
+                ns.add(n);
+                us.add(u);
+            }
+            if (ns.isEmpty()) return false;
+            if (!apply) return true;
+
+            names = ns.toArray(new String[0]);
+            urls = us.toArray(new String[0]);
+
+            // 白名单：自带的一直保留，文件里写的再加上去
+            List<String> hosts = new ArrayList<>(Arrays.asList(DEFAULT_ALLOW_HOSTS));
+            JSONArray ah = o.optJSONArray("allowHosts");
+            if (ah != null) {
+                for (int i = 0; i < ah.length(); i++) {
+                    String h2 = ah.optString(i, "").trim();
+                    if (!h2.isEmpty()) hosts.add(h2);
+                }
+            }
+            allowHosts = hosts.toArray(new String[0]);
+
+            int ls = o.optInt("lockSeconds", 0);
+            lockMs = (ls >= 5 && ls <= 60) ? ls * 1000 : DEFAULT_LOCK_MS;
+            menuTitle = o.optString("menuTitle", MENU_TITLE);
+            menuSub = o.optString("menuSub", MENU_SUB);
+            jsInit = orDefault(o.optString("jsInit", ""), JS_INIT);
+            jsFind = orDefault(o.optString("jsFind", ""), JS_FIND);
+            jsEnlarge = orDefault(o.optString("jsEnlarge", ""), JS_ENLARGE);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static String orDefault(String v, String def) {
+        return v == null || v.trim().isEmpty() ? def : v;
+    }
+
+    // 后台去下载 channels.json。manual 为 true 表示是在菜单里按「更新频道列表」触发的。
+    void fetchConfig(final boolean manual) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String text = null;
+                try {
+                    text = httpGet(CONFIG_URL + "?t=" + System.currentTimeMillis());
+                } catch (Exception e) {
+                    // 没网或 GitHub 打不开：继续用手机里存的、或者自带的
+                }
+                final String body = text;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() { onConfigFetched(body, manual); }
+                });
+            }
+        }).start();
+    }
+
+    static String httpGet(String u) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+        c.setConnectTimeout(4000);
+        c.setReadTimeout(4000);
+        c.setRequestProperty("Cache-Control", "no-cache");
+        if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode());
+        InputStream in = c.getInputStream();
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                if (out.size() > 200 * 1024) throw new IOException("文件太大");
+            }
+            return out.toString("UTF-8");
+        } finally {
+            in.close();
+            c.disconnect();
+        }
+    }
+
+    void onConfigFetched(String body, boolean manual) {
+        if (body != null && inPlayer) {
+            // 正在看节目：只存起来，下次打开才用，免得频道顺序突然变了
+            if (parseConfig(body, false)) prefs.edit().putString(KEY_CONFIG, body).apply();
+        } else if (body != null && parseConfig(body, true)) {
+            prefs.edit().putString(KEY_CONFIG, body).apply();
+            rebuildLists(manual);
+            if (manual) toast("已更新，共 " + names.length + " 个频道");
+        } else if (manual) {
+            toast(body == null ? "更新失败，请检查网络" : "频道文件的格式不对");
+        }
+        cfgDone = true;
+        tryEnter(false);
+    }
+
+    // 频道列表变了：重新画菜单和频道栏
+    void rebuildLists(boolean manual) {
+        if (idx >= names.length) idx = 0;
+        pSel = idx;
+        menuTitleV.setText(menuTitle);
+        menuSubV.setText(menuSub);
+        fillMenuRows();
+        fillPanelRows();
+        if (menu.getVisibility() == View.VISIBLE && !inPlayer) {
+            // 手动更新后，光标留在「更新频道列表」上；自动更新的话回到当前台
+            if (manual && updRow != null) updRow.requestFocus();
+            else if (btns.length > 0) btns[idx].requestFocus();
+        }
+    }
+
     // 启动时清理 cookies 和网页数据，期间显示加载页，清完再进菜单
     void startClean() {
         cleaned = false;
+        cleanDone = false;
+        cfgDone = false;
+        fetchConfig(false);
         menu.setVisibility(View.GONE);
         web.setVisibility(View.GONE);
         loading.setVisibility(View.VISIBLE);
@@ -811,7 +1015,7 @@ public class MainActivity extends Activity {
             public void onReceiveValue(Boolean ok) {
                 CookieManager.getInstance().flush();
                 long wait = LOADING_MIN_MS - (SystemClock.uptimeMillis() - t0);
-                h.postDelayed(finishClean, wait > 0 ? wait : 0);
+                h.postDelayed(markCleanDone, wait > 0 ? wait : 0);
             }
         });
         // 保底：6 秒内没清完也照样进菜单，避免卡死在加载页
@@ -831,7 +1035,7 @@ public class MainActivity extends Activity {
         menu.setVisibility(View.GONE);
         web.setVisibility(View.VISIBLE);
         web.requestFocus();
-        web.loadUrl(URLS[i]);
+        web.loadUrl(urls[i]);
     }
 
     void showMenu() {
@@ -844,14 +1048,15 @@ public class MainActivity extends Activity {
         web.loadUrl("about:blank");
         web.setVisibility(View.GONE);
         menu.setVisibility(View.VISIBLE);
-        btns[idx].requestFocus();
+        if (idx >= btns.length) idx = 0;
+        if (btns.length > 0) btns[idx].requestFocus();
     }
 
     // 每秒找一次播放器，找到并且中心没被广告盖住，就准备模拟点击
     void poll(final int g) {
         if (g != gen || tapped) return;
         if (++polls > 150) return;
-        web.evaluateJavascript(JS_FIND, new ValueCallback<String>() {
+        web.evaluateJavascript(jsFind, new ValueCallback<String>() {
             @Override
             public void onReceiveValue(String value) {
                 if (g != gen || tapped) return;
@@ -863,7 +1068,7 @@ public class MainActivity extends Activity {
                     final float y = Float.parseFloat(p[1]) * sc;
                     tapped = true;
                     // 从现在起锁定：600 毫秒后点击，再等 LOCK_MS
-                    lockUntil = System.currentTimeMillis() + 600 + LOCK_MS;
+                    lockUntil = System.currentTimeMillis() + 600 + lockMs;
                     h.postDelayed(new Runnable() {
                         @Override
                         public void run() { humanTap(x, y, g); }
@@ -905,9 +1110,9 @@ public class MainActivity extends Activity {
         h.postDelayed(new Runnable() {
             @Override
             public void run() {
-                if (g == gen) web.evaluateJavascript(JS_ENLARGE, null);
+                if (g == gen) web.evaluateJavascript(jsEnlarge, null);
             }
-        }, LOCK_MS);
+        }, lockMs);
     }
 
     boolean isAd(String host, String url) {
@@ -1019,11 +1224,11 @@ public class MainActivity extends Activity {
     public boolean onKeyDown(int k, KeyEvent e) {
         if (inPlayer) {
             if (k == KeyEvent.KEYCODE_CHANNEL_UP) {
-                openChannel((idx + 1) % URLS.length);
+                openChannel((idx + 1) % urls.length);
                 return true;
             }
             if (k == KeyEvent.KEYCODE_CHANNEL_DOWN) {
-                openChannel((idx - 1 + URLS.length) % URLS.length);
+                openChannel((idx - 1 + urls.length) % urls.length);
                 return true;
             }
         }
